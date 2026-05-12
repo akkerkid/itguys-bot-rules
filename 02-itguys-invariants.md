@@ -65,3 +65,54 @@ These rules are non-negotiable. If your work would violate one, label the issue
   production database from a test.
 - **Paste literal pytest output in the PR body.** Include the summary line and exit
   code footer. Never just claim "tests passed."
+
+## Shared GPU host — 172.30.30.50 (RTX A6000, 48 GB VRAM)
+
+This host is shared. `speaches` STT jobs (port 8000) are **highest priority** — they
+block live call recordings from being transcribed. LLM inference is lower priority.
+Govern yourself accordingly.
+
+**Python client setup (mandatory)**
+```python
+from ollama import Client
+import os
+client = Client(
+    host=os.environ.get('OLLAMA_HOST', 'http://localhost:11434'),
+    timeout=600   # GPU may be busy loading another model — be patient
+)
+```
+
+**Before starting an iteration / batch**
+Check `/api/ps` — if more than ~35 GB is occupied, wait 60 s and retry (up to 10
+times) before failing. The host may be mid-generation.
+```python
+import time, urllib.request, json
+def wait_for_vram_headroom(needed_gb=20, host=None):
+    host = host or os.environ.get('OLLAMA_HOST', 'http://localhost:11434')
+    for _ in range(10):
+        with urllib.request.urlopen(f'{host}/api/ps', timeout=10) as r:
+            used = sum(m.get('size_vram', 0) for m in json.loads(r.read()).get('models', []))
+        if used / 1e9 < (48 - needed_gb):
+            return True
+        time.sleep(60)
+    return False
+```
+
+**After your iteration / batch completes (mandatory)**
+Release VRAM immediately so STT and other bots can use it:
+```python
+client.generate(model=os.environ.get('RALPH_OLLAMA_MODEL'), keep_alive=0)
+```
+Or via curl in a shell script:
+```bash
+curl -s -X POST "${OLLAMA_HOST}/api/generate" \
+  -d "{\"model\": \"${RALPH_OLLAMA_MODEL}\", \"keep_alive\": 0}" -o /dev/null || true
+```
+
+**Rules**
+- Never hardcode `172.30.30.50` or `localhost:11434` — always use `$OLLAMA_HOST`
+- One parallel inference at a time — Ollama queues but VRAM is shared
+- Do NOT set `keep_alive=0` on every individual call within a batch (the model
+  would thrash — load/unload on every record). Only on the **last** call.
+- If your request fails with 503 or connection error mid-iteration, wait 120 s and
+  retry once before treating it as a code bug
